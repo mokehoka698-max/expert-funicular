@@ -1,4 +1,4 @@
-name: Windows 7 KVM with Cloudflare noVNC
+name: Windows 7 KVM with FTP Download & noVNC
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ on:
 jobs:
   win7-kvm-novnc:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
     # ============================================
@@ -36,6 +36,7 @@ jobs:
         echo "=== CPU Virtualization ==="
         if grep -E "svm|vmx" /proc/cpuinfo > /dev/null; then
           echo "✅ AMD-V/Intel VT-x supported"
+          grep -E "svm|vmx" /proc/cpuinfo | head -3
         else
           echo "❌ No virtualization support"
           exit 1
@@ -48,72 +49,108 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          qemu-kvm qemu-system-x86 qemu-utils \
-          libvirt-daemon-system libvirt-clients \
-          wget curl git \
-          novnc websockify \
-          python3-numpy python3-numpy-dev \
-          x11vnc
+          qemu-kvm \
+          qemu-system-x86 \
+          qemu-utils \
+          libvirt-daemon-system \
+          libvirt-clients \
+          bridge-utils \
+          virtinst \
+          wget \
+          curl \
+          git \
+          novnc \
+          websockify \
+          python3-numpy
 
         # Install Cloudflare Tunnel (cloudflared)
         wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
         sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
         sudo chmod +x /usr/local/bin/cloudflared
 
+        # Add user to kvm group
         sudo usermod -aG kvm $USER
         sudo systemctl start libvirtd
+        sudo systemctl enable libvirtd
+
         echo "✅ All tools installed"
+        qemu-system-x86_64 --version | head -1
 
     # ============================================
-    # 3. DOWNLOAD WINDOWS 7 ISO
+    # 3. DOWNLOAD WINDOWS 7 ISO VIA FTP
     # ============================================
-    - name: Download Windows 7 ISO from Cloudflare Tunnel
+    - name: Download Windows 7 ISO from FTP
       run: |
-        echo "=== Downloading Windows 7 ISO ==="
-        # Try multiple methods to download
-        curl -L --progress-bar -o Win7_HomePrem_SP1_English_x64.iso \
-          https://complement-incentives-fragrance-persistent.trycloudflare.com/Win7_HomePrem_SP1_English_x64.iso || \
-        wget -q --show-progress -O Win7_HomePrem_SP1_English_x64.iso \
-          https://complement-incentives-fragrance-persistent.trycloudflare.com/Win7_HomePrem_SP1_English_x64.iso
+        echo "=== Downloading Windows 7 ISO from FTP Server ==="
+        echo "Server: eu-central-1.sftpcloud.io"
+        echo "File: /Win7_HomePrem_SP1_English_x64.iso"
+        echo ""
+        
+        # Download using wget with FTP protocol
+        wget --user="e2e659ab20164d5aaae048a28ffbcc72" \
+             --password="GLbcGNceXpUZBpaB0Ic57VnYZN72myDz" \
+             --progress=bar:force \
+             -O Win7_HomePrem_SP1_English_x64.iso \
+             ftp://eu-central-1.sftpcloud.io/Win7_HomePrem_SP1_English_x64.iso
 
+        # Verify download
         if [ -f Win7_HomePrem_SP1_English_x64.iso ]; then
-          echo "✅ ISO downloaded: $(ls -lh Win7_HomePrem_SP1_English_x64.iso)"
+          ISO_SIZE=$(ls -lh Win7_HomePrem_SP1_English_x64.iso | awk '{print $5}')
+          echo ""
+          echo "✅ ISO downloaded successfully"
+          echo "   Size: $ISO_SIZE"
+          echo "   Location: $(pwd)/Win7_HomePrem_SP1_English_x64.iso"
+          
+          # Validate it's an ISO file
+          file Win7_HomePrem_SP1_English_x64.iso
         else
           echo "❌ Failed to download ISO"
-          echo "Please check if the Cloudflare Tunnel URL is still active"
+          echo "Please check:"
+          echo "  - FTP server is accessible"
+          echo "  - Credentials are correct"
+          echo "  - File exists at the specified path"
           exit 1
         fi
 
     # ============================================
-    # 4. CREATE VM DISK AND NETWORK CONFIG
+    # 4. CREATE VIRTUAL DISK
     # ============================================
-    - name: Create VM disk and network config
+    - name: Create VM disk
       run: |
         echo "=== Creating VM Disk ==="
         qemu-img create -f qcow2 win7.qcow2 ${{ github.event.inputs.vm_disk_size || 30 }}G
-
-        # Create network configuration script for VM
-        cat > network-setup.ps1 << 'EOF'
-        # Windows PowerShell script to configure network inside VM
-        # This will be run inside Windows 7 after installation
-        Write-Host "Configuring network..."
-        netsh interface ip set address "Local Area Connection" static 10.0.2.15 255.255.255.0 10.0.2.2
-        netsh interface ip set dns "Local Area Connection" static 8.8.8.8
-        netsh firewall set opmode disable
-        Write-Host "Network configured"
-        EOF
-
-        echo "✅ VM disk and network config created"
+        echo "✅ Disk created: $(ls -lh win7.qcow2)"
 
     # ============================================
-    # 5. START WINDOWS 7 VM WITH NETWORK
+    # 5. DOWNLOAD VIRTIO DRIVERS
     # ============================================
-    - name: Start Windows 7 VM with network
+    - name: Download VirtIO drivers (optional)
       run: |
-        echo "=== Starting Windows 7 VM with Network ==="
+        echo "=== Downloading VirtIO Drivers ==="
+        wget -q -O virtio-win.iso \
+          https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso 2>/dev/null || \
+          echo "⚠️  VirtIO drivers download skipped (optional)"
+        
+        if [ -f virtio-win.iso ]; then
+          echo "✅ VirtIO drivers downloaded: $(ls -lh virtio-win.iso)"
+        fi
 
-        # QEMU with user-mode networking and port forwarding
-        sudo qemu-system-x86_64 \
+    # ============================================
+    # 6. START WINDOWS 7 VM WITH KVM AND NETWORK
+    # ============================================
+    - name: Start Windows 7 VM with KVM
+      run: |
+        echo "=== Starting Windows 7 VM with KVM ==="
+        echo "Configuration:"
+        echo "  CPU: ${{ github.event.inputs.vm_cpu || 2 }} cores"
+        echo "  RAM: ${{ github.event.inputs.vm_ram || 2048 }} MB"
+        echo "  Disk: ${{ github.event.inputs.vm_disk_size || 30 }} GB"
+        echo "  Network: User-mode (SLIRP) with port forwarding"
+        echo "  VNC: :0 (port 5900)"
+        echo ""
+
+        # Build QEMU command with network port forwarding
+        QEMU_CMD="sudo qemu-system-x86_64 \
           -enable-kvm \
           -cpu host,kvm=off,hv_vapic,hv_relaxed,hv_spinlocks=0x1fff,hv_time \
           -smp cores=${{ github.event.inputs.vm_cpu || 2 }},threads=1 \
@@ -124,15 +161,35 @@ jobs:
           -device virtio-net,netdev=net0 \
           -vga vmware \
           -vnc :0 \
-          -daemonize
+          -daemonize"
 
+        # Add VirtIO drivers if available
+        if [ -f virtio-win.iso ]; then
+          QEMU_CMD="$QEMU_CMD -drive file=virtio-win.iso,media=cdrom"
+        fi
+
+        # Execute QEMU
+        eval $QEMU_CMD
+
+        # Wait for VM to start
         sleep 5
-        echo "✅ VM started with network forwarding"
-        echo "   - RDP forwarded to localhost:3389"
-        echo "   - SSH forwarded to localhost:2222"
+
+        # Verify VM is running
+        if ps aux | grep -q "[q]emu-system-x86_64"; then
+          echo "✅ Windows 7 VM started successfully"
+          echo ""
+          echo "📡 Network Ports Forwarded:"
+          echo "   - RDP:  localhost:3389 → VM:3389"
+          echo "   - SSH:  localhost:2222 → VM:22"
+          echo ""
+          echo "🖥️  VNC: localhost:5900"
+        else
+          echo "❌ Failed to start VM"
+          exit 1
+        fi
 
     # ============================================
-    # 6. SETUP noVNC WITH WEBSOCKET
+    # 7. SETUP NOVNC
     # ============================================
     - name: Setup noVNC
       run: |
@@ -144,89 +201,123 @@ jobs:
 
         # Start websockify to bridge VNC to WebSocket
         cd websockify
-        sudo python3 -m websockify --web ../noVNC 8080 localhost:5900 &
+        nohup sudo python3 -m websockify --web ../noVNC 8080 localhost:5900 > /tmp/novnc.log 2>&1 &
         cd ..
 
         # Wait for noVNC to start
-        sleep 3
-        echo "✅ noVNC running on port 8080"
+        sleep 5
+
+        if ps aux | grep -q "[w]ebsockify"; then
+          echo "✅ noVNC running on port 8080"
+          echo "   WebSocket bridge: localhost:8080"
+        else
+          echo "⚠️  noVNC failed to start"
+          cat /tmp/novnc.log
+        fi
 
     # ============================================
-    # 7. START CLOUDFLARE TUNNEL
+    # 8. START CLOUDFLARE TUNNEL
     # ============================================
     - name: Start Cloudflare Tunnel
       run: |
         echo "=== Starting Cloudflare Tunnel ==="
 
-        # Run cloudflared tunnel to expose noVNC
+        # Start cloudflared tunnel
         nohup cloudflared tunnel --url http://localhost:8080 --no-autoupdate \
           > cloudflare.log 2>&1 &
 
         # Wait for tunnel to establish
-        sleep 10
+        sleep 15
 
         # Extract the tunnel URL
         TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare.com' cloudflare.log | head -1)
 
         if [ -n "$TUNNEL_URL" ]; then
           echo "✅ Cloudflare Tunnel established"
-          echo "🔗 noVNC Access URL: $TUNNEL_URL"
-          echo "   (Add /vnc.html to access the viewer)"
           echo ""
-          echo "📝 Access Instructions:"
+          echo "🌐 NOVNC ACCESS URL: $TUNNEL_URL/vnc.html"
+          echo ""
+          echo "📝 Instructions:"
           echo "   1. Open the URL above in your browser"
           echo "   2. Click 'Connect' in the noVNC interface"
-          echo "   3. You will see the Windows 7 desktop"
+          echo "   3. You will see the Windows 7 installation screen"
+          echo ""
+          echo "🔗 Tunnel URL saved to GITHUB_ENV"
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
         else
-          echo "⚠️  Cloudflare Tunnel URL not found"
+          echo "⚠️  Cloudflare Tunnel failed to start"
           echo "Check cloudflare.log for details:"
           cat cloudflare.log
         fi
 
-        # Save URL for later steps
-        echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
-
     # ============================================
-    # 8. MONITOR VM AND SERVICES
+    # 9. DISPLAY CONNECTION INFO
     # ============================================
-    - name: Monitor VM and services
+    - name: Display connection information
       run: |
-        echo "=== Service Status ==="
-        echo "QEMU Process:"
-        ps aux | grep qemu-system-x86_64 | grep -v grep || echo "Not running"
-
+        echo "=== 📊 CONNECTION INFORMATION ==="
         echo ""
-        echo "noVNC Process:"
-        ps aux | grep websockify | grep -v grep || echo "Not running"
-
-        echo ""
-        echo "Cloudflare Tunnel Process:"
-        ps aux | grep cloudflared | grep -v grep || echo "Not running"
-
-        echo ""
-        echo "Network Forwarding Rules:"
-        sudo iptables -t nat -L -n -v | grep -E "3389|2222" || echo "No forwarding rules found"
-
-    # ============================================
-    # 9. KEEP SERVICES RUNNING
-    # ============================================
-    - name: Keep services alive
-      run: |
-        echo "=== Keeping services running ==="
-        echo "Services will run for the duration of the job"
-        echo ""
-        echo "⏰ Press Ctrl+C to stop when done"
-
-        # Display important information
-        echo "=== Connection Information ==="
+        echo "🌐 Web Access (noVNC via Cloudflare):"
         if [ -n "$TUNNEL_URL" ]; then
-          echo "🌐 noVNC Access: $TUNNEL_URL/vnc.html"
-          echo "   Password: (none)"
+          echo "   URL: $TUNNEL_URL/vnc.html"
+        else
+          echo "   ⚠️  Tunnel not available (check logs)"
         fi
         echo ""
-        echo "🔌 VM Network Ports:"
-        echo "   - RDP: localhost:3389 (forwarded to VM)"
-        echo "   - SSH: localhost:2222 (forwarded to VM)"
+        echo "🖥️  VNC Direct Access:"
+        echo "   Address: localhost:5900"
+        echo "   Password: (none)"
+        echo ""
+        echo "🔌 RDP Access (once Windows is installed):"
+        echo "   Address: localhost:3389"
+        echo "   Username: (Windows credentials)"
+        echo ""
+        echo "🔌 SSH Access (if enabled in Windows):"
+        echo "   Address: localhost:2222"
+        echo ""
+        echo "📂 VM Files:"
+        echo "   ISO: $(pwd)/Win7_HomePrem_SP1_English_x64.iso"
+        echo "   Disk: $(pwd)/win7.qcow2"
+        echo "   Size: $(du -h win7.qcow2 | cut -f1)"
+        echo ""
+
+    # ============================================
+    # 10. MONITOR SERVICES
+    # ============================================
+    - name: Monitor services
+      run: |
+        echo "=== 🔍 Service Status ==="
+        echo ""
+        echo "QEMU Process:"
+        ps aux | grep "[q]emu-system-x86_64" || echo "  ❌ Not running"
+        echo ""
+        echo "noVNC Process:"
+        ps aux | grep "[w]ebsockify" || echo "  ❌ Not running"
+        echo ""
+        echo "Cloudflare Tunnel Process:"
+        ps aux | grep "[c]loudflared" || echo "  ❌ Not running"
+        echo ""
+        echo "=== System Resources ==="
+        free -h
+        echo ""
+        echo "=== VM Disk Usage ==="
+        df -h $(pwd)
+
+    # ============================================
+    # 11. KEEP SERVICES ALIVE
+    # ============================================
+    - name: Keep services running
+      run: |
+        echo "=== ⏳ Keeping services running ==="
+        echo "The VM will continue running until the job is cancelled"
+        echo ""
+        echo "To access the VM:"
+        if [ -n "$TUNNEL_URL" ]; then
+          echo "  🌐 Open: $TUNNEL_URL/vnc.html"
+        fi
+        echo "  🖥️  Or use VNC client: localhost:5900"
+        echo ""
+        echo "⏱️  Press 'Cancel workflow' in GitHub Actions to stop"
         echo ""
 
         # Keep the job running
@@ -234,22 +325,92 @@ jobs:
           sleep 60
           # Check if QEMU is still running
           if ! ps aux | grep -q "[q]emu-system-x86_64"; then
-            echo "⚠️  QEMU VM stopped unexpectedly"
+            echo "⚠️  WARNING: QEMU VM stopped unexpectedly at $(date)"
+            echo "Check logs above for details"
             break
           fi
-          echo "✅ Services still running at $(date)"
+          echo "✅ Services running - $(date)"
         done
 
     # ============================================
-    # 10. CLEANUP
+    # 12. COLLECT LOGS
+    # ============================================
+    - name: Collect logs
+      if: always()
+      run: |
+        echo "=== 📋 Collecting logs ==="
+        
+        echo "QEMU logs:"
+        sudo journalctl -u libvirtd --no-pager | tail -20 || echo "No libvirt logs"
+        echo ""
+        
+        echo "Cloudflare logs:"
+        if [ -f cloudflare.log ]; then
+          cat cloudflare.log
+        else
+          echo "No Cloudflare logs"
+        fi
+        echo ""
+        
+        echo "noVNC logs:"
+        if [ -f /tmp/novnc.log ]; then
+          cat /tmp/novnc.log
+        else
+          echo "No noVNC logs"
+        fi
+
+    # ============================================
+    # 13. CLEANUP
     # ============================================
     - name: Cleanup
       if: always()
       run: |
-        echo "=== Cleaning up ==="
+        echo "=== 🧹 Cleaning up ==="
+        
+        # Stop VM gracefully
+        echo "Stopping VM..."
         sudo pkill -TERM -f qemu-system-x86_64 || true
+        sleep 3
+        sudo pkill -9 -f qemu-system-x86_64 || true
+        
+        # Stop noVNC
+        echo "Stopping noVNC..."
         sudo pkill -f websockify || true
+        
+        # Stop Cloudflare Tunnel
+        echo "Stopping Cloudflare Tunnel..."
         sudo pkill -f cloudflared || true
-        rm -f win7.qcow2 Win7_HomePrem_SP1_English_x64.iso
+        
+        # Remove files
+        echo "Removing files..."
+        rm -f win7.qcow2 Win7_HomePrem_SP1_English_x64.iso virtio-win.iso
         rm -rf noVNC websockify
+        rm -f cloudflare.log /tmp/novnc.log
+        
         echo "✅ Cleanup complete"
+
+    # ============================================
+    # 14. FINAL STATUS
+    # ============================================
+    - name: Final status
+      if: always()
+      run: |
+        echo "=== 🏁 Workflow Summary ==="
+        echo ""
+        echo "Status: ${{ job.status }}"
+        echo "ISO: Win7_HomePrem_SP1_English_x64.iso"
+        echo "KVM: ${{ steps.check-kvm.outputs.kvm-status || 'Unknown' }}"
+        echo ""
+        echo "Access Methods:"
+        if [ -n "$TUNNEL_URL" ]; then
+          echo "  ✅ Cloudflare Tunnel: $TUNNEL_URL/vnc.html"
+        else
+          echo "  ❌ Cloudflare Tunnel: Not available"
+        fi
+        echo "  ✅ VNC Direct: localhost:5900"
+        echo "  ✅ RDP: localhost:3389"
+        echo "  ✅ SSH: localhost:2222"
+        echo ""
+        echo "Job started: ${{ github.event.created_at }}"
+        echo "Runner: ${{ runner.name }}"
+        echo "OS: ${{ runner.os }}"
