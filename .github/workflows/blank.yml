@@ -26,6 +26,7 @@ jobs:
     # 1. SYSTEM VALIDATION
     # ============================================
     - name: Check KVM readiness
+      id: kvm-check
       run: |
         echo "=== KVM Module Status ==="
         lsmod | grep -E "kvm|ccp|irqbypass" || echo "KVM modules not loaded"
@@ -37,6 +38,7 @@ jobs:
         if grep -E "svm|vmx" /proc/cpuinfo > /dev/null; then
           echo "✅ AMD-V/Intel VT-x supported"
           grep -E "svm|vmx" /proc/cpuinfo | head -3
+          echo "kvm-status=supported" >> $GITHUB_OUTPUT
         else
           echo "❌ No virtualization support"
           exit 1
@@ -68,7 +70,8 @@ jobs:
           websockify \
           python3-numpy \
           dosfstools \
-          ntfs-3g
+          ntfs-3g \
+          lsof
 
         # Install Cloudflare Tunnel (cloudflared)
         wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -122,7 +125,35 @@ jobs:
         fi
 
     # ============================================
-    # 4. CREATE VIRTUAL DISK (30 GB)
+    # 4. CLEAN UP ANY EXISTING VM PROCESSES
+    # ============================================
+    - name: Clean up existing VM processes
+      run: |
+        echo "=== Cleaning up existing VM processes ==="
+        
+        # Kill any existing QEMU processes
+        sudo pkill -TERM -f qemu-system-x86_64 || true
+        sleep 3
+        sudo pkill -9 -f qemu-system-x86_64 || true
+        
+        # Remove any stale lock files
+        sudo rm -f /var/lock/qemu* || true
+        sudo rm -f /tmp/qemu* || true
+        
+        # Check if any process is using the disk
+        echo "Checking for processes using win7.qcow2..."
+        lsof | grep win7.qcow2 || echo "No processes using the disk"
+        
+        # Remove old disk if exists (to avoid lock issues)
+        if [ -f win7.qcow2 ]; then
+          echo "Removing old disk to avoid lock issues..."
+          rm -f win7.qcow2
+        fi
+        
+        echo "✅ Cleanup complete"
+
+    # ============================================
+    # 5. CREATE VIRTUAL DISK (30 GB)
     # ============================================
     - name: Create VM disk
       run: |
@@ -138,12 +169,9 @@ jobs:
         # Verify disk creation
         if [ -f win7.qcow2 ]; then
           DISK_SIZE=$(ls -lh win7.qcow2 | awk '{print $5}')
-          DISK_INFO=$(qemu-img info win7.qcow2)
           echo ""
           echo "✅ VM Disk created successfully"
           echo "   Size: $DISK_SIZE"
-          echo "   Info:"
-          echo "$DISK_INFO"
         else
           echo "❌ Failed to create VM disk"
           exit 1
@@ -155,7 +183,7 @@ jobs:
         df -h /
 
     # ============================================
-    # 5. DOWNLOAD VIRTIO DRIVERS
+    # 6. DOWNLOAD VIRTIO DRIVERS
     # ============================================
     - name: Download VirtIO drivers (optional)
       run: |
@@ -174,7 +202,7 @@ jobs:
         fi
 
     # ============================================
-    # 6. START WINDOWS 7 VM WITH KVM AND NETWORK
+    # 7. START WINDOWS 7 VM WITH KVM AND NETWORK
     # ============================================
     - name: Start Windows 7 VM with KVM
       run: |
@@ -185,10 +213,10 @@ jobs:
         echo "  Disk: ${{ github.event.inputs.vm_disk_size || 30 }} GB (QCOW2)"
         echo "  Network: User-mode (SLIRP) with port forwarding"
         echo "  VNC: :0 (port 5900)"
-        echo "  Drive: virtio (with fallback to IDE)"
         echo ""
 
         # Build QEMU command with explicit drive configuration
+        # Using -snapshot flag to prevent write locks for testing
         QEMU_CMD="sudo qemu-system-x86_64 \
           -enable-kvm \
           -cpu host,kvm=off,hv_vapic,hv_relaxed,hv_spinlocks=0x1fff,hv_time \
@@ -209,8 +237,7 @@ jobs:
         fi
 
         # Execute QEMU
-        echo "Executing: $QEMU_CMD"
-        echo ""
+        echo "Starting VM..."
         eval $QEMU_CMD
 
         # Wait for VM to start
@@ -230,41 +257,44 @@ jobs:
           echo "   - SSH:  localhost:2222 → VM:22"
           echo ""
           echo "🖥️  VNC: localhost:5900"
-          echo ""
-          echo "💾 Disk Configuration:"
-          echo "   - Main Disk: win7.qcow2 (${{ github.event.inputs.vm_disk_size || 30 }} GB, QCOW2)"
-          echo "   - CD-ROM 1: Win7_HomePrem_SP1_English_x64.iso (Windows 7 Installation)"
-          if [ -f virtio-win.iso ]; then
-            echo "   - CD-ROM 2: virtio-win.iso (VirtIO Drivers)"
-          fi
         else
           echo "❌ Failed to start VM"
           exit 1
         fi
 
     # ============================================
-    # 7. VM DISK INFORMATION
+    # 8. DISPLAY VM DISK INFORMATION (SAFE MODE)
     # ============================================
     - name: Display VM disk information
       run: |
         echo "=== 💾 VM Disk Information ==="
         echo ""
-        echo "QCOW2 Disk Info:"
-        qemu-img info win7.qcow2
-        echo ""
-        echo "Disk Usage:"
-        du -sh win7.qcow2
+        
+        # Check if disk exists
+        if [ -f win7.qcow2 ]; then
+          echo "Disk File: win7.qcow2"
+          echo "File Size: $(ls -lh win7.qcow2 | awk '{print $5}')"
+          echo ""
+          
+          # Try to get disk info without locking
+          echo "QCOW2 Disk Info (read-only):"
+          sudo qemu-img info --force-share win7.qcow2 2>/dev/null || \
+            qemu-img info win7.qcow2 2>/dev/null || \
+            echo "  ℹ️  Disk is in use - showing basic info only"
+          
+          echo ""
+          echo "Disk Usage:"
+          du -sh win7.qcow2 2>/dev/null || echo "  Cannot determine usage (disk in use)"
+        else
+          echo "❌ Disk file not found"
+        fi
+        
         echo ""
         echo "Available Space on Host:"
         df -h /
-        echo ""
-        
-        # Check disk health
-        echo "Disk Health Check:"
-        qemu-img check win7.qcow2 || echo "Disk check passed"
 
     # ============================================
-    # 8. SETUP NOVNC
+    # 9. SETUP NOVNC
     # ============================================
     - name: Setup noVNC
       run: |
@@ -291,7 +321,7 @@ jobs:
         fi
 
     # ============================================
-    # 9. START CLOUDFLARE TUNNEL
+    # 10. START CLOUDFLARE TUNNEL
     # ============================================
     - name: Start Cloudflare Tunnel
       run: |
@@ -326,7 +356,7 @@ jobs:
         fi
 
     # ============================================
-    # 10. DISPLAY CONNECTION AND DISK INFO
+    # 11. DISPLAY CONNECTION AND DISK INFO
     # ============================================
     - name: Display connection and disk information
       run: |
@@ -354,7 +384,9 @@ jobs:
         echo "   File: $(pwd)/win7.qcow2"
         echo "   Size: ${{ github.event.inputs.vm_disk_size || 30 }} GB"
         echo "   Format: QCOW2"
-        echo "   Actual Usage: $(du -h win7.qcow2 | cut -f1)"
+        if [ -f win7.qcow2 ]; then
+          echo "   Actual Usage: $(du -h win7.qcow2 2>/dev/null | cut -f1 || echo 'N/A')"
+        fi
         echo ""
         echo "📂 ISO Files:"
         echo "   Windows 7: $(pwd)/Win7_HomePrem_SP1_English_x64.iso"
@@ -366,7 +398,7 @@ jobs:
         echo ""
 
     # ============================================
-    # 11. MONITOR SERVICES
+    # 12. MONITOR SERVICES
     # ============================================
     - name: Monitor services
       run: |
@@ -385,13 +417,10 @@ jobs:
         free -h
         echo ""
         echo "=== VM Disk Usage ==="
-        df -h $(pwd)
-        echo ""
-        echo "=== Disk I/O Statistics ==="
-        iostat -d 1 2 | grep -E "Device|sda|sdb" || echo "iostat not available"
+        df -h $(pwd) 2>/dev/null || echo "Cannot determine disk usage"
 
     # ============================================
-    # 12. KEEP SERVICES ALIVE
+    # 13. KEEP SERVICES ALIVE
     # ============================================
     - name: Keep services running
       run: |
@@ -405,7 +434,9 @@ jobs:
         echo "  🖥️  Or use VNC client: localhost:5900"
         echo ""
         echo "💾 Disk Status:"
-        echo "  Current usage: $(du -h win7.qcow2 | cut -f1) / ${{ github.event.inputs.vm_disk_size || 30 }} GB"
+        if [ -f win7.qcow2 ]; then
+          echo "  Current usage: $(du -h win7.qcow2 2>/dev/null | cut -f1 || echo 'N/A') / ${{ github.event.inputs.vm_disk_size || 30 }} GB"
+        fi
         echo ""
         echo "⏱️  Press 'Cancel workflow' in GitHub Actions to stop"
         echo ""
@@ -420,14 +451,14 @@ jobs:
             break
           fi
           # Display disk usage every 5 minutes
-          if [ $((SECONDS % 300)) -eq 0 ]; then
-            echo "📊 Disk usage at $(date): $(du -h win7.qcow2 | cut -f1)"
+          if [ $((SECONDS % 300)) -eq 0 ] && [ -f win7.qcow2 ]; then
+            echo "📊 Disk usage at $(date): $(du -h win7.qcow2 2>/dev/null | cut -f1 || echo 'N/A')"
           fi
           echo "✅ Services running - $(date)"
         done
 
     # ============================================
-    # 13. COLLECT LOGS
+    # 14. COLLECT LOGS
     # ============================================
     - name: Collect logs
       if: always()
@@ -452,13 +483,9 @@ jobs:
         else
           echo "No noVNC logs"
         fi
-        echo ""
-        
-        echo "Disk Info:"
-        qemu-img info win7.qcow2 || echo "Disk info not available"
 
     # ============================================
-    # 14. CLEANUP
+    # 15. CLEANUP
     # ============================================
     - name: Cleanup
       if: always()
@@ -479,6 +506,10 @@ jobs:
         echo "Stopping Cloudflare Tunnel..."
         sudo pkill -f cloudflared || true
         
+        # Remove lock files
+        sudo rm -f /var/lock/qemu* || true
+        sudo rm -f /tmp/qemu* || true
+        
         # Remove files
         echo "Removing files..."
         rm -f win7.qcow2 Win7_HomePrem_SP1_English_x64.iso virtio-win.iso
@@ -488,7 +519,7 @@ jobs:
         echo "✅ Cleanup complete"
 
     # ============================================
-    # 15. FINAL STATUS
+    # 16. FINAL STATUS
     # ============================================
     - name: Final status
       if: always()
@@ -498,7 +529,7 @@ jobs:
         echo "Status: ${{ job.status }}"
         echo "ISO: Win7_HomePrem_SP1_English_x64.iso"
         echo "Disk: 30 GB QCOW2"
-        echo "KVM: ${{ steps.check-kvm.outputs.kvm-status || 'Unknown' }}"
+        echo "KVM: ${{ steps.kvm-check.outputs.kvm-status || 'Unknown' }}"
         echo ""
         echo "Access Methods:"
         if [ -n "$TUNNEL_URL" ]; then
@@ -513,6 +544,3 @@ jobs:
         echo "Job started: ${{ github.event.created_at }}"
         echo "Runner: ${{ runner.name }}"
         echo "OS: ${{ runner.os }}"
-        echo ""
-        echo "Disk Usage:"
-        df -h / | grep -E "Filesystem|/$"
