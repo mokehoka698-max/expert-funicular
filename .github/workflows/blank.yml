@@ -1,4 +1,4 @@
-name: Windows 7 KVM Test with Pinggy ISO
+name: Windows 7 KVM with Cloudflare noVNC
 
 on:
   workflow_dispatch:
@@ -15,16 +15,12 @@ on:
         description: 'VM Disk Size in GB'
         required: false
         default: '30'
-      boot_timeout:
-        description: 'Boot timeout in seconds'
-        required: false
-        default: '600'
 
 jobs:
-  win7-kvm-test:
+  win7-kvm-novnc:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    
+
     steps:
     # ============================================
     # 1. SYSTEM VALIDATION
@@ -40,7 +36,6 @@ jobs:
         echo "=== CPU Virtualization ==="
         if grep -E "svm|vmx" /proc/cpuinfo > /dev/null; then
           echo "✅ AMD-V/Intel VT-x supported"
-          grep -E "svm|vmx" /proc/cpuinfo | head -3
         else
           echo "❌ No virtualization support"
           exit 1
@@ -49,224 +44,212 @@ jobs:
     # ============================================
     # 2. INSTALL DEPENDENCIES
     # ============================================
-    - name: Install KVM and dependencies
+    - name: Install KVM, noVNC, and Cloudflare
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          qemu-kvm \
-          qemu-system-x86 \
-          qemu-utils \
-          libvirt-daemon-system \
-          libvirt-clients \
-          bridge-utils \
-          virtinst \
-          wget \
-          curl \
-          ovmf \
-          seabios
-        
-        # Add user to kvm group
+          qemu-kvm qemu-system-x86 qemu-utils \
+          libvirt-daemon-system libvirt-clients \
+          wget curl git \
+          novnc websockify \
+          python3-numpy python3-numpy-dev \
+          x11vnc
+
+        # Install Cloudflare Tunnel (cloudflared)
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+        sudo chmod +x /usr/local/bin/cloudflared
+
         sudo usermod -aG kvm $USER
-        sudo usermod -aG libvirt $USER
-        
-        # Start libvirt
         sudo systemctl start libvirtd
-        sudo systemctl enable libvirtd
-        
-        echo "✅ KVM tools installed"
-        qemu-system-x86_64 --version | head -1
+        echo "✅ All tools installed"
 
     # ============================================
     # 3. DOWNLOAD WINDOWS 7 ISO
     # ============================================
-    - name: Download Windows 7 ISO from Pinggy
+    - name: Download Windows 7 ISO from Cloudflare Tunnel
       run: |
         echo "=== Downloading Windows 7 ISO ==="
-        
-        # Download with the required header to bypass pinggy security page
-        curl -L -H "X-Pinggy-No-Screen: true" \
-          -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-          --progress-bar \
-          -o Win7_HomePrem_SP1_English_x64.iso \
-          https://uidpz-34-16-63-80.run.pinggy-free.link/Win7_HomePrem_SP1_English_x64.iso
-        
-        # Verify download
+        # Try multiple methods to download
+        curl -L --progress-bar -o Win7_HomePrem_SP1_English_x64.iso \
+          https://complement-incentives-fragrance-persistent.trycloudflare.com/Win7_HomePrem_SP1_English_x64.iso || \
+        wget -q --show-progress -O Win7_HomePrem_SP1_English_x64.iso \
+          https://complement-incentives-fragrance-persistent.trycloudflare.com/Win7_HomePrem_SP1_English_x64.iso
+
         if [ -f Win7_HomePrem_SP1_English_x64.iso ]; then
-          ISO_SIZE=$(ls -lh Win7_HomePrem_SP1_English_x64.iso | awk '{print $5}')
-          echo "✅ ISO downloaded successfully (Size: $ISO_SIZE)"
-          
-          # Check if it's a valid ISO
-          file Win7_HomePrem_SP1_English_x64.iso
+          echo "✅ ISO downloaded: $(ls -lh Win7_HomePrem_SP1_English_x64.iso)"
         else
           echo "❌ Failed to download ISO"
+          echo "Please check if the Cloudflare Tunnel URL is still active"
           exit 1
         fi
 
     # ============================================
-    # 4. CREATE VIRTUAL DISK
+    # 4. CREATE VM DISK AND NETWORK CONFIG
     # ============================================
-    - name: Create VM disk
+    - name: Create VM disk and network config
       run: |
         echo "=== Creating VM Disk ==="
         qemu-img create -f qcow2 win7.qcow2 ${{ github.event.inputs.vm_disk_size || 30 }}G
-        echo "✅ Disk created: $(ls -lh win7.qcow2)"
+
+        # Create network configuration script for VM
+        cat > network-setup.ps1 << 'EOF'
+        # Windows PowerShell script to configure network inside VM
+        # This will be run inside Windows 7 after installation
+        Write-Host "Configuring network..."
+        netsh interface ip set address "Local Area Connection" static 10.0.2.15 255.255.255.0 10.0.2.2
+        netsh interface ip set dns "Local Area Connection" static 8.8.8.8
+        netsh firewall set opmode disable
+        Write-Host "Network configured"
+        EOF
+
+        echo "✅ VM disk and network config created"
 
     # ============================================
-    # 5. DOWNLOAD VIRTIO DRIVERS (OPTIONAL)
+    # 5. START WINDOWS 7 VM WITH NETWORK
     # ============================================
-    - name: Download VirtIO drivers
+    - name: Start Windows 7 VM with network
       run: |
-        echo "=== Downloading VirtIO Drivers ==="
-        wget -q -O virtio-win.iso \
-          https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso || \
-          echo "⚠️  VirtIO drivers download skipped (optional)"
-        
-        if [ -f virtio-win.iso ]; then
-          echo "✅ VirtIO drivers downloaded: $(ls -lh virtio-win.iso)"
-        fi
+        echo "=== Starting Windows 7 VM with Network ==="
 
-    # ============================================
-    # 6. START WINDOWS 7 VM WITH KVM
-    # ============================================
-    - name: Start Windows 7 VM
-      run: |
-        echo "=== Starting Windows 7 VM with KVM ==="
-        echo "CPU: ${{ github.event.inputs.vm_cpu || 2 }} cores"
-        echo "RAM: ${{ github.event.inputs.vm_ram || 2048 }} MB"
-        echo "Disk: ${{ github.event.inputs.vm_disk_size || 30 }} GB"
-        
-        # Build QEMU command
-        QEMU_CMD="sudo qemu-system-x86_64 \
+        # QEMU with user-mode networking and port forwarding
+        sudo qemu-system-x86_64 \
           -enable-kvm \
           -cpu host,kvm=off,hv_vapic,hv_relaxed,hv_spinlocks=0x1fff,hv_time \
           -smp cores=${{ github.event.inputs.vm_cpu || 2 }},threads=1 \
           -m ${{ github.event.inputs.vm_ram || 2048 }} \
           -drive file=win7.qcow2,format=qcow2,if=virtio \
           -drive file=Win7_HomePrem_SP1_English_x64.iso,media=cdrom \
-          -netdev user,id=net0 \
+          -netdev user,id=net0,hostfwd=tcp::3389-:3389,hostfwd=tcp::2222-:22 \
           -device virtio-net,netdev=net0 \
           -vga vmware \
           -vnc :0 \
-          -daemonize"
-        
-        # Add VirtIO drivers if available
-        if [ -f virtio-win.iso ]; then
-          QEMU_CMD="$QEMU_CMD -drive file=virtio-win.iso,media=cdrom"
-        fi
-        
-        # Execute QEMU
-        eval $QEMU_CMD
-        
-        # Wait for VM to start
+          -daemonize
+
         sleep 5
-        
-        # Verify VM is running
-        if ps aux | grep -q "[q]emu-system-x86_64"; then
-          echo "✅ Windows 7 VM started successfully"
-          echo "VNC available at: localhost:5900"
+        echo "✅ VM started with network forwarding"
+        echo "   - RDP forwarded to localhost:3389"
+        echo "   - SSH forwarded to localhost:2222"
+
+    # ============================================
+    # 6. SETUP noVNC WITH WEBSOCKET
+    # ============================================
+    - name: Setup noVNC
+      run: |
+        echo "=== Setting up noVNC ==="
+
+        # Clone noVNC
+        git clone --depth=1 https://github.com/novnc/noVNC.git
+        git clone --depth=1 https://github.com/novnc/websockify.git
+
+        # Start websockify to bridge VNC to WebSocket
+        cd websockify
+        sudo python3 -m websockify --web ../noVNC 8080 localhost:5900 &
+        cd ..
+
+        # Wait for noVNC to start
+        sleep 3
+        echo "✅ noVNC running on port 8080"
+
+    # ============================================
+    # 7. START CLOUDFLARE TUNNEL
+    # ============================================
+    - name: Start Cloudflare Tunnel
+      run: |
+        echo "=== Starting Cloudflare Tunnel ==="
+
+        # Run cloudflared tunnel to expose noVNC
+        nohup cloudflared tunnel --url http://localhost:8080 --no-autoupdate \
+          > cloudflare.log 2>&1 &
+
+        # Wait for tunnel to establish
+        sleep 10
+
+        # Extract the tunnel URL
+        TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare.com' cloudflare.log | head -1)
+
+        if [ -n "$TUNNEL_URL" ]; then
+          echo "✅ Cloudflare Tunnel established"
+          echo "🔗 noVNC Access URL: $TUNNEL_URL"
+          echo "   (Add /vnc.html to access the viewer)"
+          echo ""
+          echo "📝 Access Instructions:"
+          echo "   1. Open the URL above in your browser"
+          echo "   2. Click 'Connect' in the noVNC interface"
+          echo "   3. You will see the Windows 7 desktop"
         else
-          echo "❌ Failed to start VM"
-          exit 1
+          echo "⚠️  Cloudflare Tunnel URL not found"
+          echo "Check cloudflare.log for details:"
+          cat cloudflare.log
         fi
 
-    # ============================================
-    # 7. MONITOR VM STATUS
-    # ============================================
-    - name: Monitor VM
-      run: |
-        echo "=== VM Process Info ==="
-        ps aux | grep qemu-system-x86_64 | grep -v grep || echo "QEMU process not found"
-        echo ""
-        echo "=== System Resources ==="
-        free -h
-        echo ""
-        echo "=== Disk Usage ==="
-        df -h
-        echo ""
-        echo "=== KVM Statistics ==="
-        sudo cat /sys/kernel/debug/kvm/* 2>/dev/null | head -20 || echo "KVM debug not available"
+        # Save URL for later steps
+        echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
 
     # ============================================
-    # 8. VM BOOT STATUS (OPTIONAL)
+    # 8. MONITOR VM AND SERVICES
     # ============================================
-    - name: Check VM boot status
+    - name: Monitor VM and services
       run: |
-        echo "=== Waiting for VM to boot ==="
-        echo "⏰ This may take 5-10 minutes for first boot"
-        
-        # Check if VM is still running after boot timeout
-        BOOT_TIMEOUT=${{ github.event.inputs.boot_timeout || 600 }}
-        for i in $(seq 1 $((BOOT_TIMEOUT / 30))); do
-          if ps aux | grep -q "[q]emu-system-x86_64"; then
-            echo "✅ VM still running (check $i of $((BOOT_TIMEOUT / 30)))"
-          else
-            echo "❌ VM stopped unexpectedly"
-            exit 1
+        echo "=== Service Status ==="
+        echo "QEMU Process:"
+        ps aux | grep qemu-system-x86_64 | grep -v grep || echo "Not running"
+
+        echo ""
+        echo "noVNC Process:"
+        ps aux | grep websockify | grep -v grep || echo "Not running"
+
+        echo ""
+        echo "Cloudflare Tunnel Process:"
+        ps aux | grep cloudflared | grep -v grep || echo "Not running"
+
+        echo ""
+        echo "Network Forwarding Rules:"
+        sudo iptables -t nat -L -n -v | grep -E "3389|2222" || echo "No forwarding rules found"
+
+    # ============================================
+    # 9. KEEP SERVICES RUNNING
+    # ============================================
+    - name: Keep services alive
+      run: |
+        echo "=== Keeping services running ==="
+        echo "Services will run for the duration of the job"
+        echo ""
+        echo "⏰ Press Ctrl+C to stop when done"
+
+        # Display important information
+        echo "=== Connection Information ==="
+        if [ -n "$TUNNEL_URL" ]; then
+          echo "🌐 noVNC Access: $TUNNEL_URL/vnc.html"
+          echo "   Password: (none)"
+        fi
+        echo ""
+        echo "🔌 VM Network Ports:"
+        echo "   - RDP: localhost:3389 (forwarded to VM)"
+        echo "   - SSH: localhost:2222 (forwarded to VM)"
+        echo ""
+
+        # Keep the job running
+        while true; do
+          sleep 60
+          # Check if QEMU is still running
+          if ! ps aux | grep -q "[q]emu-system-x86_64"; then
+            echo "⚠️  QEMU VM stopped unexpectedly"
+            break
           fi
-          sleep 30
+          echo "✅ Services still running at $(date)"
         done
-        
-        echo "✅ VM boot period completed"
-
-    # ============================================
-    # 9. VM LOGS AND DEBUG INFO
-    # ============================================
-    - name: Collect VM logs
-      if: always()
-      run: |
-        echo "=== VM Logs ==="
-        sudo journalctl -u libvirtd --no-pager | tail -20 || echo "No libvirt logs"
-        echo ""
-        echo "=== QEMU Logs ==="
-        sudo find /var/log -name "*qemu*" -exec tail -10 {} \; 2>/dev/null || echo "No QEMU logs"
 
     # ============================================
     # 10. CLEANUP
     # ============================================
-    - name: Stop VM and cleanup
+    - name: Cleanup
       if: always()
       run: |
-        echo "=== Stopping Windows 7 VM ==="
-        
-        # Graceful shutdown
+        echo "=== Cleaning up ==="
         sudo pkill -TERM -f qemu-system-x86_64 || true
-        sleep 5
-        
-        # Force kill if needed
-        sudo pkill -9 -f qemu-system-x86_64 || true
-        
-        # Clean up files
-        echo "=== Cleaning up files ==="
-        rm -f win7.qcow2 Win7_HomePrem_SP1_English_x64.iso virtio-win.iso || true
-        
-        # Clear any leftover processes
-        sudo killall qemu-system-x86_64 2>/dev/null || true
-        
+        sudo pkill -f websockify || true
+        sudo pkill -f cloudflared || true
+        rm -f win7.qcow2 Win7_HomePrem_SP1_English_x64.iso
+        rm -rf noVNC websockify
         echo "✅ Cleanup complete"
-
-    # ============================================
-    # 11. FINAL STATUS
-    # ============================================
-    - name: Final status
-      if: always()
-      run: |
-        echo "=== Workflow Summary ==="
-        echo "✅ KVM Test Completed"
-        echo "ISO: Win7_HomePrem_SP1_English_x64.iso"
-        echo "Result: ${{ job.status }}"
-        echo "Runner: ${{ runner.name }}"
-        echo "OS: ${{ runner.os }}"
-
-    # ============================================
-    # 12. UPLOAD LOGS (OPTIONAL)
-    # ============================================
-    - name: Upload logs
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: kvm-debug-logs
-        path: |
-          /tmp/*.log
-          /var/log/libvirt/*
-          ~/.local/share/libvirt/
-        retention-days: 7
