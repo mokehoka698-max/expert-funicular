@@ -1,0 +1,52 @@
+name: KVM Readiness Check
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  kvm-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Check KVM support
+      run: |
+        echo "Checking KVM support..."
+        if [ -e /dev/kvm ]; then
+          echo "✅ /dev/kvm exists"
+          ls -la /dev/kvm
+        else
+          echo "❌ /dev/kvm not found"
+          exit 1
+        fi
+        
+    - name: Check CPU virtualization flags
+      run: |
+        echo "Checking CPU virtualization flags..."
+        if grep -E "(vmx|svm)" /proc/cpuinfo > /dev/null; then
+          echo "✅ CPU virtualization supported"
+          grep -E "(vmx|svm)" /proc/cpuinfo | head -5
+        else
+          echo "❌ CPU virtualization not supported"
+          exit 1
+        fi
+        
+    - name: Verify KVM module is loaded
+      run: |
+        echo "Checking KVM modules..."
+        lsmod | grep kvm || echo "KVM modules not loaded"
+        
+    - name: Check group membership
+      run: |
+        echo "Checking kvm group..."
+        groups
+        if groups | grep -q kvm; then
+          echo "✅ User in kvm group"
+        else
+          echo "⚠️  User not in kvm group (may need sudo for KVM access)"
+        fi
