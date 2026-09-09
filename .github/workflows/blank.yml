@@ -1,4 +1,4 @@
-name: Windows 7 KVM Test with SFTP
+name: Windows 7 KVM Test with Pinggy ISO
 
 on:
   workflow_dispatch:
@@ -11,16 +11,28 @@ on:
         description: 'VM CPU cores'
         required: false
         default: '2'
+      vm_disk_size:
+        description: 'VM Disk Size in GB'
+        required: false
+        default: '30'
+      boot_timeout:
+        description: 'Boot timeout in seconds'
+        required: false
+        default: '600'
 
 jobs:
   win7-kvm-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     
     steps:
+    # ============================================
+    # 1. SYSTEM VALIDATION
+    # ============================================
     - name: Check KVM readiness
       run: |
         echo "=== KVM Module Status ==="
-        lsmod | grep -E "kvm|ccp|irqbypass"
+        lsmod | grep -E "kvm|ccp|irqbypass" || echo "KVM modules not loaded"
         echo ""
         echo "=== KVM Device ==="
         ls -la /dev/kvm
@@ -28,103 +40,233 @@ jobs:
         echo "=== CPU Virtualization ==="
         if grep -E "svm|vmx" /proc/cpuinfo > /dev/null; then
           echo "✅ AMD-V/Intel VT-x supported"
+          grep -E "svm|vmx" /proc/cpuinfo | head -3
         else
           echo "❌ No virtualization support"
           exit 1
         fi
 
+    # ============================================
+    # 2. INSTALL DEPENDENCIES
+    # ============================================
     - name: Install KVM and dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           qemu-kvm \
           qemu-system-x86 \
+          qemu-utils \
           libvirt-daemon-system \
           libvirt-clients \
           bridge-utils \
           virtinst \
           wget \
           curl \
-          sshpass \
-          lftp
+          ovmf \
+          seabios
+        
+        # Add user to kvm group
         sudo usermod -aG kvm $USER
+        sudo usermod -aG libvirt $USER
+        
+        # Start libvirt
         sudo systemctl start libvirtd
+        sudo systemctl enable libvirtd
+        
+        echo "✅ KVM tools installed"
+        qemu-system-x86_64 --version | head -1
 
-    - name: Download Windows 7 ISO from SFTP
-      env:
-        SFTP_USER: ${{ secrets.SFTP_USERNAME }}
-        SFTP_PASSWORD: ${{ secrets.SFTP_PASSWORD }}
-        SFTP_HOST: ${{ secrets.SFTP_HOST }}
-        SFTP_PATH: ${{ secrets.SFTP_PATH }}
+    # ============================================
+    # 3. DOWNLOAD WINDOWS 7 ISO
+    # ============================================
+    - name: Download Windows 7 ISO from Pinggy
       run: |
-        echo "=== Downloading Windows 7 ISO from SFTP ==="
+        echo "=== Downloading Windows 7 ISO ==="
         
-        # Using sshpass with sftp
-        export SSHPASS="$SFTP_PASSWORD"
+        # Download with the required header to bypass pinggy security page
+        curl -L -H "X-Pinggy-No-Screen: true" \
+          -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+          --progress-bar \
+          -o Win7_HomePrem_SP1_English_x64.iso \
+          https://uidpz-34-16-63-80.run.pinggy-free.link/Win7_HomePrem_SP1_English_x64.iso
         
-        # Download using sftp with sshpass
-        sshpass -e sftp -o StrictHostKeyChecking=no "$SFTP_USER@$SFTP_HOST" <<EOF
-        get $SFTP_PATH /tmp/Win7_HomePrem_SP1_English_x64.iso
-        bye
-        EOF
-        
-        # Alternative using lftp (more reliable)
-        # lftp -u "$SFTP_USER","$SFTP_PASSWORD" sftp://$SFTP_HOST -e "get $SFTP_PATH -o /tmp/Win7_HomePrem_SP1_English_x64.iso; quit"
-        
-        if [ -f /tmp/Win7_HomePrem_SP1_English_x64.iso ]; then
-          echo "✅ ISO downloaded successfully"
-          ls -lh /tmp/Win7_HomePrem_SP1_English_x64.iso
+        # Verify download
+        if [ -f Win7_HomePrem_SP1_English_x64.iso ]; then
+          ISO_SIZE=$(ls -lh Win7_HomePrem_SP1_English_x64.iso | awk '{print $5}')
+          echo "✅ ISO downloaded successfully (Size: $ISO_SIZE)"
+          
+          # Check if it's a valid ISO
+          file Win7_HomePrem_SP1_English_x64.iso
         else
           echo "❌ Failed to download ISO"
           exit 1
         fi
 
-    - name: Create Windows 7 VM disk
+    # ============================================
+    # 4. CREATE VIRTUAL DISK
+    # ============================================
+    - name: Create VM disk
       run: |
         echo "=== Creating VM Disk ==="
-        qemu-img create -f qcow2 win7.qcow2 30G
-        echo "✅ Disk created"
+        qemu-img create -f qcow2 win7.qcow2 ${{ github.event.inputs.vm_disk_size || 30 }}G
+        echo "✅ Disk created: $(ls -lh win7.qcow2)"
 
-    - name: Run Windows 7 with KVM
+    # ============================================
+    # 5. DOWNLOAD VIRTIO DRIVERS (OPTIONAL)
+    # ============================================
+    - name: Download VirtIO drivers
       run: |
-        echo "=== Starting Windows 7 VM ==="
+        echo "=== Downloading VirtIO Drivers ==="
+        wget -q -O virtio-win.iso \
+          https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso || \
+          echo "⚠️  VirtIO drivers download skipped (optional)"
         
-        # Run QEMU with KVM
-        sudo qemu-system-x86_64 \
+        if [ -f virtio-win.iso ]; then
+          echo "✅ VirtIO drivers downloaded: $(ls -lh virtio-win.iso)"
+        fi
+
+    # ============================================
+    # 6. START WINDOWS 7 VM WITH KVM
+    # ============================================
+    - name: Start Windows 7 VM
+      run: |
+        echo "=== Starting Windows 7 VM with KVM ==="
+        echo "CPU: ${{ github.event.inputs.vm_cpu || 2 }} cores"
+        echo "RAM: ${{ github.event.inputs.vm_ram || 2048 }} MB"
+        echo "Disk: ${{ github.event.inputs.vm_disk_size || 30 }} GB"
+        
+        # Build QEMU command
+        QEMU_CMD="sudo qemu-system-x86_64 \
           -enable-kvm \
           -cpu host,kvm=off,hv_vapic,hv_relaxed,hv_spinlocks=0x1fff,hv_time \
           -smp cores=${{ github.event.inputs.vm_cpu || 2 }},threads=1 \
           -m ${{ github.event.inputs.vm_ram || 2048 }} \
           -drive file=win7.qcow2,format=qcow2,if=virtio \
-          -drive file=/tmp/Win7_HomePrem_SP1_English_x64.iso,media=cdrom \
+          -drive file=Win7_HomePrem_SP1_English_x64.iso,media=cdrom \
           -netdev user,id=net0 \
           -device virtio-net,netdev=net0 \
           -vga vmware \
           -vnc :0 \
-          -daemonize
+          -daemonize"
         
+        # Add VirtIO drivers if available
+        if [ -f virtio-win.iso ]; then
+          QEMU_CMD="$QEMU_CMD -drive file=virtio-win.iso,media=cdrom"
+        fi
+        
+        # Execute QEMU
+        eval $QEMU_CMD
+        
+        # Wait for VM to start
         sleep 5
-        echo "✅ Windows 7 VM started with KVM"
-        echo "VNC available at: localhost:5900"
+        
+        # Verify VM is running
+        if ps aux | grep -q "[q]emu-system-x86_64"; then
+          echo "✅ Windows 7 VM started successfully"
+          echo "VNC available at: localhost:5900"
+        else
+          echo "❌ Failed to start VM"
+          exit 1
+        fi
 
+    # ============================================
+    # 7. MONITOR VM STATUS
+    # ============================================
     - name: Monitor VM
       run: |
-        echo "=== VM Status ==="
-        ps aux | grep qemu | grep -v grep || echo "QEMU process not found"
+        echo "=== VM Process Info ==="
+        ps aux | grep qemu-system-x86_64 | grep -v grep || echo "QEMU process not found"
         echo ""
         echo "=== System Resources ==="
         free -h
         echo ""
-        echo "=== KVM Stats ==="
+        echo "=== Disk Usage ==="
+        df -h
+        echo ""
+        echo "=== KVM Statistics ==="
         sudo cat /sys/kernel/debug/kvm/* 2>/dev/null | head -20 || echo "KVM debug not available"
 
-    - name: Wait and cleanup
+    # ============================================
+    # 8. VM BOOT STATUS (OPTIONAL)
+    # ============================================
+    - name: Check VM boot status
+      run: |
+        echo "=== Waiting for VM to boot ==="
+        echo "⏰ This may take 5-10 minutes for first boot"
+        
+        # Check if VM is still running after boot timeout
+        BOOT_TIMEOUT=${{ github.event.inputs.boot_timeout || 600 }}
+        for i in $(seq 1 $((BOOT_TIMEOUT / 30))); do
+          if ps aux | grep -q "[q]emu-system-x86_64"; then
+            echo "✅ VM still running (check $i of $((BOOT_TIMEOUT / 30)))"
+          else
+            echo "❌ VM stopped unexpectedly"
+            exit 1
+          fi
+          sleep 30
+        done
+        
+        echo "✅ VM boot period completed"
+
+    # ============================================
+    # 9. VM LOGS AND DEBUG INFO
+    # ============================================
+    - name: Collect VM logs
       if: always()
       run: |
-        echo "=== Waiting for VM to run ==="
-        sleep 300  # Let VM run for 5 minutes
+        echo "=== VM Logs ==="
+        sudo journalctl -u libvirtd --no-pager | tail -20 || echo "No libvirt logs"
+        echo ""
+        echo "=== QEMU Logs ==="
+        sudo find /var/log -name "*qemu*" -exec tail -10 {} \; 2>/dev/null || echo "No QEMU logs"
+
+    # ============================================
+    # 10. CLEANUP
+    # ============================================
+    - name: Stop VM and cleanup
+      if: always()
+      run: |
+        echo "=== Stopping Windows 7 VM ==="
         
-        echo "=== Stopping VM ==="
-        sudo pkill -f qemu-system-x86_64 || true
-        rm -f win7.qcow2 /tmp/Win7_HomePrem_SP1_English_x64.iso
+        # Graceful shutdown
+        sudo pkill -TERM -f qemu-system-x86_64 || true
+        sleep 5
+        
+        # Force kill if needed
+        sudo pkill -9 -f qemu-system-x86_64 || true
+        
+        # Clean up files
+        echo "=== Cleaning up files ==="
+        rm -f win7.qcow2 Win7_HomePrem_SP1_English_x64.iso virtio-win.iso || true
+        
+        # Clear any leftover processes
+        sudo killall qemu-system-x86_64 2>/dev/null || true
+        
         echo "✅ Cleanup complete"
+
+    # ============================================
+    # 11. FINAL STATUS
+    # ============================================
+    - name: Final status
+      if: always()
+      run: |
+        echo "=== Workflow Summary ==="
+        echo "✅ KVM Test Completed"
+        echo "ISO: Win7_HomePrem_SP1_English_x64.iso"
+        echo "Result: ${{ job.status }}"
+        echo "Runner: ${{ runner.name }}"
+        echo "OS: ${{ runner.os }}"
+
+    # ============================================
+    # 12. UPLOAD LOGS (OPTIONAL)
+    # ============================================
+    - name: Upload logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kvm-debug-logs
+        path: |
+          /tmp/*.log
+          /var/log/libvirt/*
+          ~/.local/share/libvirt/
+        retention-days: 7
